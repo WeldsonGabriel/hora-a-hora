@@ -9,10 +9,12 @@
 # 2) Clica "Processar CSV"
 # 3) App usa os dados processados (session_state)
 #
-# ✅ Ajustes:
+# ✅ Ajustes importantes:
 # - Parser robusto de TOTAL TRANSACTIONS (não converte 44.0 em 440)
 # - Validação cedo
 # - Labels (número exato) em cima de cada bolinha em todos os gráficos
+# - ✅ NOVO: sempre cria colunas para TODAS as empresas digitadas no sidebar, mesmo zeradas
+#   (se não houver linha no CSV para aquela empresa, a série fica 0 e o gráfico aparece)
 #
 # Secrets:
 #   .streamlit/secrets.toml
@@ -40,9 +42,8 @@ COL_ACCOUNT = "Movement Account ID"
 COL_PERSON = "Person Name"
 COL_TOTAL = "TOTAL TRANSACTIONS"
 
-DEFAULT_COMPANIES = [
-    
-]
+# Você pediu para não deixar mais nomes fixos no código:
+DEFAULT_COMPANIES: list[str] = []  # preencha no sidebar (1 por linha)
 
 
 # =========================
@@ -129,7 +130,10 @@ def validate_and_prepare(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     mask_dec0 = raw_total.str.match(r"^\d+[.,]0+$")
     if mask_dec0.any():
         examples = raw_total[mask_dec0].head(10).tolist()
-        warnings.append(f"Detectado formato decimal tipo '.0'/',0' em TOTAL TRANSACTIONS (amostra: {examples}). Parser robusto aplicado.")
+        warnings.append(
+            f"Detectado formato decimal tipo '.0'/',0' em TOTAL TRANSACTIONS (amostra: {examples}). "
+            f"Parser robusto aplicado."
+        )
 
     max_val = int(df[COL_TOTAL].max()) if len(df) else 0
     if max_val > 10_000_000:
@@ -148,30 +152,55 @@ def validate_and_prepare(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     return df, warnings, errors
 
 
-def filter_companies_by_substring(df: pd.DataFrame, allow_list: list[str]) -> pd.DataFrame:
-    allow = [x.strip().lower() for x in allow_list if x.strip()]
-    if not allow:
-        return df.iloc[0:0].copy()
-
-    def ok(name: str) -> bool:
-        n = name.lower()
-        return any(a in n for a in allow)
-
-    return df[df[COL_PERSON].apply(ok)].copy()
+# =========================
+# NOVO: Pivot com colunas FIXAS (empresas digitadas), mesmo que zeradas
+# =========================
+def normalize_label(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def build_pivot_hour_company(df: pd.DataFrame) -> pd.DataFrame:
-    pivot = (
-        df.pivot_table(index=COL_HOUR, columns=COL_PERSON, values=COL_TOTAL, aggfunc="sum", fill_value=0)
-        .sort_index()
-    )
-    if pivot.empty:
+def build_pivot_tracked(df_clean: pd.DataFrame, tracked: list[str]) -> pd.DataFrame:
+    """
+    Pivot Hora x EmpresaDigitada
+    - tracked: lista digitada no sidebar
+    - sempre cria coluna pra cada item do tracked (mesmo que não exista no CSV) -> zeros
+    - soma por substring em Person Name
+    """
+    tracked = [normalize_label(x) for x in tracked if normalize_label(x)]
+    if not tracked:
+        return pd.DataFrame()
+
+    # Horas: se tiver dados válidos, 0..última hora do CSV; senão 0..23
+    if df_clean.empty:
+        hours = list(range(0, 24))
+    else:
+        max_h = int(df_clean[COL_HOUR].max())
+        max_h = max(0, min(23, max_h))
+        hours = list(range(0, max_h + 1))
+
+    pivot = pd.DataFrame(index=hours)
+
+    if df_clean.empty:
+        for name in tracked:
+            pivot[name] = 0
+        pivot.index.name = "Hora"
         return pivot
-    max_h = int(pivot.index.max())
-    pivot = pivot.reindex(range(0, max_h + 1), fill_value=0)  # sem lacunas
+
+    person_lower = df_clean[COL_PERSON].astype(str).str.lower()
+
+    for name in tracked:
+        pat = re.escape(name.lower())
+        mask = person_lower.str.contains(pat, na=False)
+        s = df_clean.loc[mask].groupby(COL_HOUR)[COL_TOTAL].sum()
+        pivot[name] = s.reindex(hours, fill_value=0).astype("int64")
+
+    pivot.index.name = "Hora"
     return pivot
 
 
+# =========================
+# MÉTRICAS / GRÁFICOS / DISCORD
+# =========================
 def fmt_int_pt(n: int) -> str:
     return f"{n:,}".replace(",", ".")
 
@@ -310,7 +339,8 @@ with st.sidebar:
     companies_text = st.text_area(
         "Lista fixa (1 por linha)",
         value="\n".join(DEFAULT_COMPANIES),
-        height=260,
+        height=220,
+        placeholder="Ex:\nPix na Hora\nMarchaPay\n...",
     )
     allow_list = [x.strip() for x in companies_text.splitlines() if x.strip()]
 
@@ -325,8 +355,6 @@ if "processed" not in st.session_state:
     st.session_state["processed"] = False
 if "pivot" not in st.session_state:
     st.session_state["pivot"] = pd.DataFrame()
-if "df_filtered" not in st.session_state:
-    st.session_state["df_filtered"] = pd.DataFrame()
 if "filename" not in st.session_state:
     st.session_state["filename"] = None
 if "warnings" not in st.session_state:
@@ -339,27 +367,37 @@ if process and uploaded is not None:
     try:
         df_raw = read_csv_from_upload(uploaded)
         df_clean, warns, errs = validate_and_prepare(df_raw)
-        df_filtered = filter_companies_by_substring(df_clean, allow_list)
 
-        if df_filtered.empty:
+        # ✅ Pivot fixo nas empresas digitadas (mesmo zeradas)
+        pivot = build_pivot_tracked(df_clean, allow_list)
+
+        if not allow_list:
             st.session_state["processed"] = False
             st.session_state["pivot"] = pd.DataFrame()
-            st.session_state["df_filtered"] = pd.DataFrame()
             st.session_state["filename"] = uploaded.name
             st.session_state["warnings"] = warns
-            st.session_state["errors"] = ["Nenhuma linha do CSV bateu com a lista de empresas monitoradas."]
+            st.session_state["errors"] = ["Informe pelo menos 1 empresa na lista do sidebar."]
         else:
-            pivot = build_pivot_hour_company(df_filtered)
+            # Mesmo que nenhuma empresa bata no CSV, pivot ainda existe com zeros.
+            # Avisamos, mas deixamos o app seguir (para meia-noite/zerados).
+            if df_clean.empty:
+                warns = warns + ["CSV sem linhas válidas após validação. Exibindo gráficos zerados."]
+
+            # checar se alguma empresa teve match
+            if not df_clean.empty:
+                person_lower = df_clean[COL_PERSON].astype(str).str.lower()
+                matched = sum(1 for name in allow_list if person_lower.str.contains(re.escape(name.lower()), na=False).any())
+                if matched == 0:
+                    warns = warns + ["Nenhuma empresa da lista foi encontrada no CSV (por substring). Exibindo gráficos zerados."]
+
             st.session_state["processed"] = True
             st.session_state["pivot"] = pivot
-            st.session_state["df_filtered"] = df_filtered
             st.session_state["filename"] = uploaded.name
             st.session_state["warnings"] = warns
             st.session_state["errors"] = errs
     except Exception as e:
         st.session_state["processed"] = False
         st.session_state["pivot"] = pd.DataFrame()
-        st.session_state["df_filtered"] = pd.DataFrame()
         st.session_state["filename"] = uploaded.name if uploaded else None
         st.session_state["warnings"] = []
         st.session_state["errors"] = [f"Erro lendo/validando CSV: {e}"]
@@ -370,7 +408,6 @@ if not st.session_state["processed"]:
         st.info("Faça upload do CSV e clique em **Processar CSV**.")
         st.stop()
 
-    # houve upload mas ainda não processou ou deu erro
     for w in st.session_state["warnings"]:
         st.warning(w)
     for e in st.session_state["errors"]:
@@ -413,7 +450,7 @@ with tab_main:
     with c4:
         st.metric("Transações na última hora", fmt_int_pt(metrics["last_hour_total"]))
 
-    title = "Transações por Hora — Total (empresas filtradas)" if selected == "Todas" else f"Transações por Hora — {selected}"
+    title = "Transações por Hora — Total (empresas monitoradas)" if selected == "Todas" else f"Transações por Hora — {selected}"
     img_bytes = make_line_chart(series, title)
     st.image(img_bytes, caption="Transações por hora (linha)", use_container_width=True)
 
@@ -445,34 +482,37 @@ with tab_main:
         st.success(msg) if ok else st.error(msg)
 
 with tab_top10:
-    st.subheader("Top 10 empresas (filtradas) — gráficos individuais")
+    st.subheader("Top 10 empresas (da sua lista) — gráficos individuais")
 
+    # Aqui o "Top 10" é dentro das empresas digitadas (colunas do pivot).
     total_by_company = pivot.sum(axis=0).sort_values(ascending=False)
-    top10 = total_by_company.head(10)
 
-    if top10.empty:
-        st.info("Sem dados para Top 10.")
+    # garante até 10 (se você digitar menos, mostra o que tiver)
+    top_names = list(total_by_company.index[:10])
+    if not top_names:
+        st.info("Nenhuma empresa para exibir. Preencha a lista no sidebar e processe novamente.")
         st.stop()
 
     cols = st.columns(2)
     images_to_send: list[tuple[str, bytes]] = []
     last_hour_global = int(pivot.index.max()) if not pivot.empty else None
 
-    for idx, (company, total) in enumerate(top10.items(), start=1):
+    for idx, company in enumerate(top_names, start=1):
+        total = int(total_by_company.loc[company])
         series_c = pivot[company]
-        subtitle = f"Total do dia: {fmt_int_pt(int(total))} | Última hora: {fmt_hour(last_hour_global)}"
+        subtitle = f"Total do dia: {fmt_int_pt(total)} | Última hora: {fmt_hour(last_hour_global)}"
         img_c = make_line_chart(series_c, title=f"{idx}) {company}", subtitle=subtitle)
 
         images_to_send.append((f"{idx:02d} - {company}.png", img_c))
 
         target_col = cols[idx % 2]
         with target_col:
-            st.image(img_c, caption=f"{company} — Total: {fmt_int_pt(int(total))}", use_container_width=True)
+            st.image(img_c, caption=f"{company} — Total: {fmt_int_pt(total)}", use_container_width=True)
 
     st.divider()
     st.subheader("Enviar Top 10 para Discord")
 
-    ranking_lines = [f"{i}. {company} — **{fmt_int_pt(int(total))}**" for i, (company, total) in enumerate(top10.items(), start=1)]
+    ranking_lines = [f"{i}. {company} — **{fmt_int_pt(int(total_by_company.loc[company]))}**" for i, company in enumerate(top_names, start=1)]
     desc = (
         f"**Data:** {date.today().strftime('%d/%m/%Y')}\n"
         f"**Última hora disponível:** {fmt_hour(last_hour_global)}\n\n"
@@ -480,7 +520,7 @@ with tab_top10:
     )
 
     send_top10_disabled = (not webhook_url) or (len(images_to_send) == 0)
-    send_top10 = st.button("Enviar Top 10 (10 gráficos)", type="primary", disabled=send_top10_disabled, key="send_top10")
+    send_top10 = st.button("Enviar Top 10 (gráficos)", type="primary", disabled=send_top10_disabled, key="send_top10")
 
     if send_top10:
         ok, msg = discord_send_multi_images(

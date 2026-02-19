@@ -1,12 +1,17 @@
 # app.py
-# Streamlit — Transações por Hora (CSV do dia atual)
+# Streamlit — Transações por Hora (CSV do dia atual) via UPLOAD
 # Abas:
 # - Principal: cards + gráfico (Todas/Empresa) + enviar 1 gráfico (Discord)
 # - Top 10: 10 gráficos individuais (top 10 por total do dia) + enviar 10 gráficos (Discord)
 #
+# ✅ Fluxo:
+# 1) Usuário faz upload do CSV
+# 2) Clica "Processar CSV"
+# 3) App usa os dados processados (session_state)
+#
 # ✅ Ajustes:
 # - Parser robusto de TOTAL TRANSACTIONS (não converte 44.0 em 440)
-# - Validação cedo (alerta se houver formatação suspeita)
+# - Validação cedo
 # - Labels (número exato) em cima de cada bolinha em todos os gráficos
 #
 # Secrets:
@@ -16,12 +21,10 @@
 # Requisitos:
 #   pip install streamlit pandas matplotlib requests
 
-import os
-import glob
 import io
 import json
 import re
-from datetime import date, datetime
+from datetime import date
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -30,11 +33,8 @@ import streamlit as st
 
 
 # =========================
-# CONFIG PADRÃO
+# CONFIG
 # =========================
-DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
-CSV_GLOB_PATTERN = "*.csv"
-
 COL_HOUR = "Hora Transacao"
 COL_ACCOUNT = "Movement Account ID"
 COL_PERSON = "Person Name"
@@ -77,25 +77,9 @@ DEFAULT_COMPANIES = [
 
 
 # =========================
-# HELPERS
+# PARSE ROBUSTO
 # =========================
-def find_latest_csv(folder: str, pattern: str) -> str | None:
-    paths = glob.glob(os.path.join(folder, pattern))
-    if not paths:
-        return None
-    paths.sort(key=os.path.getmtime, reverse=True)
-    return paths[0]
-
-
 def parse_int_smart(value) -> int:
-    """
-    Parser robusto para:
-      - "44.0" -> 44
-      - "44,0" -> 44
-      - "79.753" -> 79753 (ponto como milhar)
-      - "1.234,0" -> 1234
-      - "1,234.0" (raro) -> 1234 (tenta inferir)
-    """
     s = str(value).strip()
     if s == "" or s.lower() in {"nan", "none"}:
         return 0
@@ -113,23 +97,19 @@ def parse_int_smart(value) -> int:
     if re.fullmatch(r"\d+(\.\d+)?", s):
         return int(round(float(s)))
 
-    # fallback: limpa lixo, tenta inferir
+    # fallback: limpa lixo e tenta inferir
     s3 = re.sub(r"[^\d,\.]", "", s)
 
-    # se tem '.' e ',' assume pt-BR (milhar '.' decimal ',')
     if "." in s3 and "," in s3:
         s3 = s3.replace(".", "").replace(",", ".")
         return int(round(float(s3)))
 
-    # só vírgula
     if "," in s3 and "." not in s3:
         return int(round(float(s3.replace(",", "."))))
 
-    # só ponto
     if "." in s3:
         return int(round(float(s3)))
 
-    # só dígitos
     s3 = re.sub(r"[^\d]", "", s3)
     return int(s3) if s3 else 0
 
@@ -138,14 +118,16 @@ def normalize_int_series(series: pd.Series) -> pd.Series:
     return series.apply(parse_int_smart).astype("int64")
 
 
-def read_csv_smart(csv_path: str) -> pd.DataFrame:
+def read_csv_from_upload(uploaded_file) -> pd.DataFrame:
+    """
+    Lê CSV a partir do upload.
+    Tenta ',' e se der ruim tenta ';'.
+    """
+    raw = uploaded_file.getvalue()
     try:
-        df = pd.read_csv(csv_path)
-        if len(df.columns) == 1 and ";" in df.columns[0]:
-            raise ValueError("Provável separador ';'")
-        return df
+        return pd.read_csv(io.BytesIO(raw))
     except Exception:
-        return pd.read_csv(csv_path, sep=";")
+        return pd.read_csv(io.BytesIO(raw), sep=";")
 
 
 def validate_and_prepare(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -168,31 +150,26 @@ def validate_and_prepare(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     df = df[~invalid_hour].copy()
     df[COL_HOUR] = df[COL_HOUR].astype(int)
 
-    # Keep raw total for early checks
+    # Keep raw totals for early checks
     raw_total = df[COL_TOTAL].astype(str).str.strip()
 
-    # Total (robusto)
+    # Total robusto
     df[COL_TOTAL] = normalize_int_series(df[COL_TOTAL])
 
-    # Early validation (pegar erro cedo)
-    # 1) Se houver muitos valores com ".0" ou ",0", verificar se o parse não "colou zero"
+    # Validação cedo
     mask_dec0 = raw_total.str.match(r"^\d+[.,]0+$")
     if mask_dec0.any():
-        # se antes era 44.0 e depois virou 440, seria suspeito.
-        # Com parser novo isso não deve acontecer; mas deixamos alerta se detectar padrão estranho.
-        raw_examples = raw_total[mask_dec0].head(10).tolist()
-        warnings.append(f"Detectado formato decimal tipo '.0'/',0' em TOTAL TRANSACTIONS (amostra: {raw_examples}). Parser robusto aplicado.")
+        examples = raw_total[mask_dec0].head(10).tolist()
+        warnings.append(f"Detectado formato decimal tipo '.0'/',0' em TOTAL TRANSACTIONS (amostra: {examples}). Parser robusto aplicado.")
 
-    # 2) Valores absurdamente altos -> alerta (configurável)
     max_val = int(df[COL_TOTAL].max()) if len(df) else 0
     if max_val > 10_000_000:
         warnings.append("TOTAL TRANSACTIONS muito alto (>10.000.000). Verifique se o CSV está com formatação inesperada.")
 
-    # Strings
     df[COL_PERSON] = df[COL_PERSON].astype(str).str.strip()
     df[COL_ACCOUNT] = df[COL_ACCOUNT].astype(str).str.strip()
 
-    # Deduplicação por (hora, empresa, conta)
+    # Consolidar duplicados
     before = len(df)
     df = df.groupby([COL_HOUR, COL_PERSON, COL_ACCOUNT], as_index=False)[COL_TOTAL].sum()
     after = len(df)
@@ -265,9 +242,6 @@ def compute_metrics(series_by_hour: pd.Series) -> dict:
 
 
 def make_line_chart(series_by_hour: pd.Series, title: str, subtitle: str | None = None) -> bytes:
-    """
-    ✅ Anota o valor exato em cima de cada bolinha.
-    """
     fig = plt.figure(figsize=(8.2, 3.2))
     ax = fig.add_subplot(111)
 
@@ -290,7 +264,6 @@ def make_line_chart(series_by_hour: pd.Series, title: str, subtitle: str | None 
         ax.set_xticks(x)
 
         max_y = max(y) if y else 0
-
         for xi, yi in zip(x, y):
             ax.annotate(
                 f"{int(yi)}",
@@ -319,10 +292,6 @@ def discord_send_multi_images(
     images: list[tuple[str, bytes]],
     chunk_size: int = 5,
 ) -> tuple[bool, str]:
-    """
-    Envia múltiplas imagens via webhook, dividindo em lotes.
-    images: lista de (filename, image_bytes)
-    """
     if not webhook_url:
         return False, "Webhook não configurado (st.secrets)."
 
@@ -360,12 +329,13 @@ def discord_send_multi_images(
 # UI
 # =========================
 st.set_page_config(page_title="Transações por Hora", layout="wide")
-st.title("Transações por Hora — Monitoramento")
+st.title("Transações por Hora — Monitoramento (Upload)")
+
+webhook_url = st.secrets.get("DISCORD_WEBHOOK_URL", "").strip()
 
 with st.sidebar:
-    st.header("Fonte do CSV")
-    folder = st.text_input("Pasta dos CSVs", value=DEFAULT_DOWNLOAD_DIR)
-    pattern = st.text_input("Padrão (glob)", value=CSV_GLOB_PATTERN)
+    st.header("CSV (Upload)")
+    uploaded = st.file_uploader("Selecione o CSV", type=["csv"])
 
     st.header("Empresas monitoradas")
     companies_text = st.text_area(
@@ -375,68 +345,91 @@ with st.sidebar:
     )
     allow_list = [x.strip() for x in companies_text.splitlines() if x.strip()]
 
+    st.header("Ação")
+    process = st.button("Processar CSV", type="primary", disabled=(uploaded is None))
+
     st.header("Discord (secrets)")
-    webhook_url = st.secrets.get("DISCORD_WEBHOOK_URL", "").strip()
     st.text_input("Webhook status", value=("configurado" if webhook_url else "não configurado"), disabled=True)
 
-    st.header("Atualização")
-    auto_refresh = st.toggle("Auto-refresh (60s)", value=True)
+# session state init
+if "processed" not in st.session_state:
+    st.session_state["processed"] = False
+if "pivot" not in st.session_state:
+    st.session_state["pivot"] = pd.DataFrame()
+if "df_filtered" not in st.session_state:
+    st.session_state["df_filtered"] = pd.DataFrame()
+if "filename" not in st.session_state:
+    st.session_state["filename"] = None
+if "warnings" not in st.session_state:
+    st.session_state["warnings"] = []
+if "errors" not in st.session_state:
+    st.session_state["errors"] = []
 
-if auto_refresh:
+# Process button
+if process and uploaded is not None:
     try:
-        st.autorefresh(interval=60_000, key="autorefresh_60s")
-    except Exception:
-        pass
+        df_raw = read_csv_from_upload(uploaded)
+        df_clean, warns, errs = validate_and_prepare(df_raw)
+        df_filtered = filter_companies_by_substring(df_clean, allow_list)
 
-latest = find_latest_csv(folder, pattern)
-if not latest:
-    st.warning(f"Nenhum CSV encontrado em: {folder} com padrão: {pattern}")
-    st.stop()
+        if df_filtered.empty:
+            st.session_state["processed"] = False
+            st.session_state["pivot"] = pd.DataFrame()
+            st.session_state["df_filtered"] = pd.DataFrame()
+            st.session_state["filename"] = uploaded.name
+            st.session_state["warnings"] = warns
+            st.session_state["errors"] = ["Nenhuma linha do CSV bateu com a lista de empresas monitoradas."]
+        else:
+            pivot = build_pivot_hour_company(df_filtered)
+            st.session_state["processed"] = True
+            st.session_state["pivot"] = pivot
+            st.session_state["df_filtered"] = df_filtered
+            st.session_state["filename"] = uploaded.name
+            st.session_state["warnings"] = warns
+            st.session_state["errors"] = errs
+    except Exception as e:
+        st.session_state["processed"] = False
+        st.session_state["pivot"] = pd.DataFrame()
+        st.session_state["df_filtered"] = pd.DataFrame()
+        st.session_state["filename"] = uploaded.name if uploaded else None
+        st.session_state["warnings"] = []
+        st.session_state["errors"] = [f"Erro lendo/validando CSV: {e}"]
 
-try:
-    df_raw = read_csv_smart(latest)
-    df_clean, warns, errs = validate_and_prepare(df_raw)
-except Exception as e:
-    st.error(f"Erro lendo/validando CSV: {e}")
-    st.stop()
+# Show status
+if not st.session_state["processed"]:
+    if uploaded is None:
+        st.info("Faça upload do CSV e clique em **Processar CSV**.")
+        st.stop()
 
-if errs:
-    for e in errs:
+    # houve upload mas ainda não processou ou deu erro
+    for w in st.session_state["warnings"]:
+        st.warning(w)
+    for e in st.session_state["errors"]:
         st.error(e)
+
+    if st.session_state["filename"]:
+        st.caption(f"Arquivo selecionado: {st.session_state['filename']}")
+
+    if st.session_state["errors"]:
+        st.stop()
+
+    st.info("Clique em **Processar CSV** para gerar os gráficos.")
     st.stop()
 
-for w in warns:
+# Processed OK
+for w in st.session_state["warnings"]:
     st.warning(w)
 
-df = filter_companies_by_substring(df_clean, allow_list)
-if df.empty:
-    st.error("Nenhuma linha do CSV bateu com a lista de empresas monitoradas.")
-    sample_names = df_clean[COL_PERSON].dropna().unique().tolist()[:25]
-    if sample_names:
-        st.write("Exemplos de 'Person Name' no CSV (amostra):")
-        st.write(sample_names)
-    st.stop()
+pivot = st.session_state["pivot"]
+filename = st.session_state["filename"] or "CSV"
 
-pivot = build_pivot_hour_company(df)
-
-hdr_left, hdr_right = st.columns([2, 1])
-with hdr_left:
-    st.caption("Arquivo em uso")
-    st.code(os.path.basename(latest), language="text")
-with hdr_right:
-    mtime = datetime.fromtimestamp(os.path.getmtime(latest))
-    st.caption(f"Modificado em: {mtime.strftime('%d/%m/%Y %H:%M:%S')}")
+st.caption(f"CSV processado: **{filename}**")
 
 tab_main, tab_top10 = st.tabs(["Principal", "Top 10 (Gráficos individuais)"])
 
 with tab_main:
-    left, right = st.columns([2, 1])
-    with left:
-        options = ["Todas"] + (list(pivot.columns) if not pivot.empty else [])
-        selected = st.selectbox("Empresa", options=options, index=0, key="empresa_main")
-    with right:
-        st.caption("Dica")
-        st.write("Selecione uma empresa para ver métricas e gráfico dessa empresa.")
+    options = ["Todas"] + (list(pivot.columns) if not pivot.empty else [])
+    selected = st.selectbox("Empresa", options=options, index=0, key="empresa_main")
 
     series = pick_series(pivot, selected)
     metrics = compute_metrics(series)
@@ -460,6 +453,9 @@ with tab_main:
     send_disabled = (not webhook_url) or series.empty
     send = st.button("Enviar resumo + gráfico", type="primary", disabled=send_disabled, key="send_main")
 
+    if not webhook_url:
+        st.info("Webhook não configurado. Defina DISCORD_WEBHOOK_URL em .streamlit/secrets.toml.")
+
     if send:
         janela = f"{metrics['date'].strftime('%d/%m/%Y')} — última hora: {fmt_hour(metrics['last_hour'])}"
         desc = (
@@ -468,7 +464,7 @@ with tab_main:
             f"**Total do dia:** {fmt_int_pt(metrics['total_day'])}\n"
             f"**Média/hora:** {fmt_int_pt(metrics['avg_hour'])}\n"
             f"**Última hora:** {fmt_int_pt(metrics['last_hour_total'])}\n"
-            f"**Fonte:** {os.path.basename(latest)}"
+            f"**Fonte:** {filename}"
         )
         ok, msg = discord_send_multi_images(
             webhook_url=webhook_url,
@@ -523,6 +519,6 @@ with tab_top10:
             title="Top 10 — Transações por Hora",
             description=desc,
             images=images_to_send,
-            chunk_size=5,  # manda 5 + 5 por segurança
+            chunk_size=5,
         )
         st.success(msg) if ok else st.error(msg)

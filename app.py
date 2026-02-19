@@ -41,38 +41,7 @@ COL_PERSON = "Person Name"
 COL_TOTAL = "TOTAL TRANSACTIONS"
 
 DEFAULT_COMPANIES = [
-    "Pix na Hora",
-    "MarchaPay",
-    "VCONSULTING",
-    "QUANTUM PAYMENTS",
-    "Pagamento Seguro LTDA",
-    "Dom Digital",
-    "Winn Pay",
-    "KP SERVICOS DIGITAIS LTDA",
-    "Otm Pagamentos",
-    "Sync Pay",
-    "Magic Pay LTDA",
-    "Neopag Intermediações",
-    "Masterfy Intermediações de Pagamentos LTDA",
-    "BNT TECNOLOGIA",
-    "NERES NEGOCIOS DIGITAIS LTDA",
-    "Beehive",
-    "APEXBET",
-    "FRENDZ",
-    "Vanessa Silva",
-    "TECNOLOGIA E PAGAMENTOS KING LTDA",
-    "CINQ PAY",
-    "JLB Loterias Marketing e Serviços",
-    "HP RECEBIVEIS",
-    "Manda Pix",
-    "BLOO",
-    "APOSTARAIZ LTDA",
-    "GRS EMPRESARIAL",
-    "PAYNEO",
-    "IG SISTEMAS",
-    "SOLUÇÕES EM PAGAMENTOS",
-    "FB OPERACOES E NEGOCIOS",
-    "WITE RECUPERATION TECNOLOGIA IA LTDA",
+    
 ]
 
 
